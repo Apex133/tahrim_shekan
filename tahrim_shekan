@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# tahrim_shekan — sanctions-bypass shell & proxy front-end
+# Routes apt/pip/npm/curl/python through Hiddify (socks :12334) via tahrim-bridge (http :8888).
+set -u
+export LC_ALL=C.UTF-8   # makes ${#} count characters, not bytes — box padding depends on it
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tahrim_shekan"
+CONF="$CONF_DIR/proxy.conf"
+PROXY="socks5h://127.0.0.1:12334"
+PROXY_HTTP="http://127.0.0.1:8888"
+TEST_URL="https://storage.googleapis.com/chrome-for-testing-public/145.0.7632.6/linux64/chrome-linux64.zip"
+VERSION="1.2"
+
+[ -f "$CONF" ] && source "$CONF"
+
+VIOLET=$'\e[38;5;141m'; GOLD=$'\e[38;5;220m'; BLUE=$'\e[38;5;75m'
+DIM=$'\e[2m'; BOLD=$'\e[1m'; OK=$'\e[38;5;114m'; WARN=$'\e[38;5;179m'; BAD=$'\e[38;5;174m'; R=$'\e[0m'
+
+proxy_exports() {
+  printf 'export https_proxy=%q http_proxy=%q HTTPS_PROXY=%q HTTP_PROXY=%q\n' "$PROXY_HTTP" "$PROXY_HTTP" "$PROXY_HTTP" "$PROXY_HTTP"
+  printf 'export all_proxy=%q ALL_PROXY=%q TAHRIM_SHEKAN=1\n' "$PROXY" "$PROXY"
+}
+
+# probe -> "verdict|code|ms|ip|loc"  (verdict: live|blocked|down)
+probe() {
+  local trace ms ip loc code
+  trace=$(curl -s --max-time 8 -x "$PROXY" -w '\n%{time_total}' "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null)
+  if [ -z "$trace" ]; then echo "down||0||"; return; fi
+  ms=$(tail -n1 <<<"$trace")
+  ip=$(grep -s '^ip=' <<<"$trace" | cut -d= -f2)
+  loc=$(grep -s '^loc=' <<<"$trace" | cut -d= -f2)
+  code=$(curl -s --max-time 8 -x "$PROXY" -r 0-255 -o /dev/null -w '%{http_code}' "$TEST_URL" 2>/dev/null)
+  loc=${loc:-"?"}; ip=${ip:-"unknown"}   # trace may time out on slow nodes
+  case "$code" in
+    200|206) echo "live|$code|$ms|$ip|$loc" ;;
+    403)     echo "blocked|$code|$ms|$ip|$loc" ;;
+    *)       echo "down|$code|$ms|$ip|$loc" ;;
+  esac
+}
+
+padc() { # padc STRING WIDTH — character-safe padding (bash %-Ns pads by bytes)
+  local s="$1" w="$2" n=${#1}
+  [ "$n" -gt "$w" ] && n=$w
+  printf '%s%*s' "${s:0:n}" $((w - n)) ""
+}
+
+P=100   # panel inner width
+
+banner() {
+  printf '%s' "$GOLD"
+  cat <<'ART'
+████████╗ ██╗  ██╗ ██╗  ██╗ ██████╗  ██╗ ███╗   ███╗  ███████╗   ██╗  ██╗   ███████╗   ██╗  ██╗   ██╗  ██╗   ███╗   ██╗
+╚══██╔══╝ ██║  ██║ ██║  ██║ ██╔══██╗ ██║ ████╗ ████║  ██╔════╝   ██║  ██║   ██╔════╝   ██║ ██╔╝   ██║  ██║   ████╗  ██║
+   ██║    ███████║ ███████║ ██████╔╝ ██║ ██╔████╔██║  ███████╗   ███████║   █████╗     █████╔╝    ███████║   ██╔██╗ ██║
+   ██║    ██╔══██║ ██╔══██║ ██╔══██╗ ██║ ██║╚██╔╝██║  ╚════██║   ██╔══██║   ██╔══╝     ██╔═██╗    ██╔══██║   ██║╚██╗██║
+   ██║    ██║  ██║ ██║  ██║ ██║  ██║ ██║ ██║ ╚═╝ ██║  ███████╗   ██║  ██║   ███████╗   ██║  ██╗   ██║  ██║   ██║ ╚████║
+   ╚═╝    ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝ ╚═╝     ╚═╝  ╚══════╝   ╚═╝  ╚═╝   ╚══════╝   ╚═╝  ╚═╝   ╚═╝  ╚═╝   ╚═╝  ╚═══╝
+ART
+  printf '%s\n' "$R"
+}
+
+# rowc BODY [COLOR] — full-width panel row
+rowc() {
+  local body pad
+  body=$(padc "$1" $((P - 4)))
+  printf '  %s│%s %s%s%s %s│%s\n' "$DIM" "$R" "${2:-}" "$body" "${2:+$R}" "$DIM" "$R"
+}
+
+# prow LEFT RIGHT [COLOR] — two-column panel row (left column 40 chars)
+prow() {
+  rowc "$(padc "$1" 40)$2" "${3:-}"
+}
+
+# titled border: ╭─ TITLE ───╮
+top_title() {
+  local t="$1" fill
+  t=" $t "
+  fill=$((P - ${#t} - 4))
+  [ "$fill" -lt 0 ] && fill=0
+  printf '  %s╭─%s%s%s%s─╮%s\n' "$DIM" "$GOLD" "$t" "$R$DIM" "$(printf '─%.0s' $(seq "$fill"))" "$R"
+}
+bot_title() { printf '  %s╰%s╯%s\n' "$DIM" "$(printf '─%.0s' $(seq $((P - 2))))" "$R"; }
+
+panel() { # panel VERDICT CODE MS IP LOC [TITLE]
+  local verdict="$1" code="$2" ms="$3" ip="$4" loc="$5"
+  local mss title L R0 R1 R2 R5 R6 R7 R8
+  [ -n "$ms" ] && mss=$(awk -v t="$ms" 'BEGIN{printf "%.2f", t}') || mss="—"
+  title="${6:-tahrim_shekan v$VERSION · tunnel status}"
+  case "$verdict" in
+    live)    L="● LIVE · HTTP $code · ${mss}s"; R0="exit [$loc] $ip" ;;
+    blocked) L="◐ TUNNEL UP — EXIT BLOCKED (403)";          R0="switch node in Hiddify" ;;
+    *)       L="○ UPSTREAM DOWN";                           R0="connect Hiddify first" ;;
+  esac
+
+  top_title "$title"
+  rowc "$(padc "$L" 40)$R0" "$([ "$verdict" = live ] && echo "$OK" || { [ "$verdict" = blocked ] && echo "$WARN" || echo "$BAD"; })"
+  prow "" ""
+  prow "bridge  $PROXY_HTTP" "socks   $PROXY"
+  prow "hiddify core in-process (GUI)" "conf    $CONF_DIR/"
+  prow "" ""
+  prow "COMMANDS" "TUNNELED AUTOMATICALLY" "$DIM"
+  prow " shell    spawn tunneled bash" "apt · pip · npm"
+  prow " exec CMD run one command" "curl · wget · git"
+  prow " monitor  live per-process view" "python urllib · snap"
+  prow " env      eval-able exports" "docker pulls · hermes"
+  prow " test     upstream check" ""
+  prow " config   edit addresses" ""
+  prow "" ""
+  prow "leave shell: Ctrl-D" "v$VERSION"
+  bot_title
+}
+
+shell() {
+  local p; p=$(probe)
+  IFS='|' read -r verdict code ms ip loc <<<"$p"
+  banner
+  panel "$verdict" "$code" "$ms" "$ip" "$loc" "tahrim_shekan v$VERSION"
+  [ "$verdict" = "down" ] && exit 1
+  printf '\n'
+  eval "$(proxy_exports)"
+  exec bash --noprofile --rcfile <(cat "$HOME/.bashrc" 2>/dev/null
+    printf "PS1='%s⚡ tsh%s \\w \\$ '" "\[\e[38;5;220m\]" "\[\e[0m\]")
+}
+
+monitor() { # monitor [once] — live view of processes using the tunnel
+  local mode="${1:-watch}" bpid up n_rows tmp
+  bpid=$(pgrep -f 'tahrim_shekan/bridge.py' | head -1)
+  [ -n "$bpid" ] || bpid="-"
+  tmp="/tmp/tahrim_mon.$$"
+  render() {
+    ss -tnp 2>/dev/null | awk -v bp="${bpid}" '
+      $1 == "ESTAB" && ($5 ~ /:8888$/ || $5 ~ /:12334$/) {
+        pid=""; name=""
+        if (match($0, /\("[^"]+",pid=[0-9]+/)) {
+          s = substr($0, RSTART+2, RLENGTH-2)
+          gsub(/"/, "", s)
+          sub(/,pid=/, " ", s); split(s, a, " "); name=a[1]; pid=a[2]
+        }
+        if (pid == "") next
+        if ($5 ~ /:12334$/ && pid == bp) { up++; next }
+        via = ($5 ~ /:8888$/) ? "bridge" : "socks"
+        k = pid SUBSEP name SUBSEP via; cnt[k]++
+      }
+      END {
+        for (k in cnt) { split(k, p, SUBSEP); printf "%s|%s|%s|%d\n", p[1], p[2], p[3], cnt[k] }
+        printf "UPSTREAM|%d\n", up+0
+      }' > "$tmp"
+    printf '%s⟐ tahrim monitor%s %s· %s · bridge pid %s · Ctrl-C stops%s\n\n' "$GOLD" "$R" "$DIM" "$(date '+%H:%M:%S')" "$bpid" "$R"
+    printf '%s%-8s %-22s %-6s %s%s\n' "$DIM" "PID" "PROCESS" "CONNS" "VIA" "$R"
+    up=0; n_rows=0
+    while IFS='|' read -r pid name via n; do
+      if [ "$pid" = "UPSTREAM" ]; then up="${name:-0}"; continue; fi
+      printf '%-8s %-22s %-6s %s\n' "$pid" "$(padc "$name" 22)" "$n" "$via"
+      n_rows=$((n_rows + 1))
+    done < "$tmp"
+    [ "$n_rows" -eq 0 ] && echo "  (no processes are using the tunnel right now)"
+    printf '%sbridge → node: %s active tunnels%s\n' "$DIM" "$up" "$R"
+  }
+  if [ "$mode" = "once" ]; then render; rm -f "$tmp"; return; fi
+  trap 'printf "\n"; exit 0' INT
+  while true; do clear; render; sleep 1; done
+}
+
+case "${1:-status}" in
+  status)  banner; p=$(probe); IFS='|' read -r verdict code ms ip loc <<<"$p"; panel "$verdict" "$code" "$ms" "$ip" "$loc"; printf '\n' ;;
+  shell)   shell ;;
+  env)     proxy_exports ;;
+  exec)    shift; eval "$(proxy_exports)"; "$@" ;;
+  monitor) shift; monitor "$@" ;;
+  test)    p=$(probe); IFS='|' read -r verdict code ms ip loc <<<"$p"
+           case "$verdict" in
+             live)    echo "LIVE: HTTP $code in $(awk -v t="$ms" 'BEGIN{printf "%.2f",t}')s via [$loc] $ip" ;;
+             blocked) echo "BLOCKED: tunnel up but exit is sanctioned (HTTP 403) — switch node" ;;
+             *)       echo "DOWN: no answer at $PROXY" ;;
+           esac
+           [ "$verdict" = live ] ;;
+  config)  mkdir -p "$CONF_DIR"; [ -f "$CONF" ] || echo '# PROXY="socks5h://127.0.0.1:12334"   # hiddify socks inbound
+# PROXY_HTTP="http://127.0.0.1:8888"  # tahrim-bridge (leave unless you moved it)' > "$CONF"; exec "${EDITOR:-nano}" "$CONF" ;;
+  *)
+    printf '%s⚡ tahrim_shekan%s %s[v%s]%s — sanctions-bypass shell\n\n' "$GOLD" "$R" "$DIM" "$VERSION" "$R"
+    printf '  %stahrim_shekan%s              status panel\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan shell%s        tunneled shell (apt/pip/npm/curl/python through the tunnel)\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan exec CMD%s     run one command through the tunnel\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan monitor%s      live view: which processes use the tunnel\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan env%s          print eval-able proxy exports\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan test%s         upstream check with exit IP\n' "$GOLD" "$R"
+    printf '  %stahrim_shekan config%s       edit proxy addresses\n' "$GOLD" "$R"
+    ;;
+esac
